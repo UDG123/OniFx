@@ -40,7 +40,10 @@ CONSUMER_GROUP: str = "orchestrator_cg"
 CONSUMER_NAME: str = os.getenv("CONSUMER_NAME", f"orch_worker_{os.getpid()}")
 PENDING_ZSET: str = "oniquant:pending_trades"
 DLQ_STREAM: str = "oniquant:dead_letter_queue"
+SHADOW_LEDGER_ZSET: str = "oniquant:shadow_ledger"
+MATCH_VALIDATION_STREAM: str = "oniquant:match_validation"
 MAX_RETRIES: int = 3
+SHADOW_MODE: bool = os.getenv("GLOBAL_SHADOW_MODE", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Lua Script: Atomic XACK + ZADD
@@ -161,8 +164,13 @@ class OrchestrationWorker:
         if live_params:
             payload["live_wfo_params"] = orjson.loads(live_params)
 
-        # Step 2: Bayesian evaluation
+        # Step 2: Tri-State Bayesian evaluation
         decision = await self._arbiter.evaluate(payload)
+
+        # ── Shadow Ledger: log all tri-state decisions ────────────
+        # Every signal's tri-state results are recorded for CPCV analysis,
+        # regardless of whether the active regime authorized or rejected.
+        await self._log_shadow_decisions(signal_id, payload, decision)
 
         if decision["decision"] == "AUTHORIZE":
             # Step 3a: Atomic XACK + ZADD via Lua script (CRITICAL-02)
@@ -176,6 +184,8 @@ class OrchestrationWorker:
                 "posterior_probability": decision["posterior_probability"],
                 "routing_target": decision["routing_target"],
                 "authorized_at": now,
+                "tri_state_decisions": decision.get("tri_state_decisions", {}),
+                "active_regime": decision.get("active_regime", "conservative"),
             }
 
             await self._atomic_ack_route(
@@ -183,6 +193,10 @@ class OrchestrationWorker:
                 args=[msg_id, orjson.dumps(trade_payload), str(expiry)],
             )
         else:
+            # ── Shadow Mode: route to Synthetic Matcher if ANY regime authorized
+            if SHADOW_MODE and decision.get("any_regime_authorized"):
+                await self._route_shadow_to_matcher(signal_id, payload, decision)
+
             # Step 3b: Log rejected signal to TimescaleDB, then ACK
             try:
                 await insert_signal(
@@ -196,6 +210,8 @@ class OrchestrationWorker:
                         "decision": "REJECT",
                         "posterior": decision["posterior_probability"],
                         "reasoning": decision["reasoning_math"],
+                        "tri_state": decision.get("tri_state_decisions", {}),
+                        "active_regime": decision.get("active_regime"),
                     },
                 )
             except Exception as e:
@@ -207,6 +223,101 @@ class OrchestrationWorker:
 
         self._processed += 1
         return True
+
+    async def _log_shadow_decisions(
+        self,
+        signal_id: str,
+        payload: dict[str, Any],
+        decision: dict[str, Any],
+    ) -> None:
+        """
+        Log all tri-state regime decisions to the Shadow Ledger ZSET.
+
+        Each regime's decision is stored as a separate entry so the CPCV
+        optimizer can independently evaluate Conservative/Active/Aggressive
+        performance across combinatorial train/test splits.
+
+        ZSET key: oniquant:shadow_ledger
+        Score: timestamp (for temporal ordering and range queries)
+        Member: orjson-encoded per-regime decision payload
+        """
+        now = time.time()
+        tri_state = decision.get("tri_state", {})
+        pipe = self._pool.pipeline(transaction=False)
+
+        for regime_name, regime_result in tri_state.items():
+            shadow_entry = {
+                "signal_id": signal_id,
+                "regime": regime_name,
+                "decision": regime_result["decision"],
+                "posterior": regime_result["posterior"],
+                "threshold": regime_result["threshold"],
+                "power_prior": regime_result["power_prior"],
+                "tempered_L": regime_result["tempered_L"],
+                "a0": regime_result["a0"],
+                "T": regime_result["T"],
+                "asset_symbol": payload.get("asset_symbol", "UNKNOWN"),
+                "desk_id": payload.get("desk_id", "unknown"),
+                "target_price": payload.get("target_price", 0),
+                "signal_direction": payload.get("signal_direction", 0),
+                "pnl": 0.0,           # Updated by synthetic matcher
+                "fill_price": 0.0,    # Updated by synthetic matcher
+                "slippage_bps": 0.0,  # Updated by synthetic matcher
+            }
+            # Use signal_id + regime as uniqueness discriminator
+            member_key = orjson.dumps(shadow_entry)
+            pipe.zadd(SHADOW_LEDGER_ZSET, {member_key: now})
+
+        # Trim to last 100K entries to bound memory
+        pipe.zremrangebyrank(SHADOW_LEDGER_ZSET, 0, -100001)
+
+        try:
+            await pipe.execute()
+        except Exception as e:
+            await log.adebug("shadow_ledger_write_error", error=str(e))
+
+    async def _route_shadow_to_matcher(
+        self,
+        signal_id: str,
+        payload: dict[str, Any],
+        decision: dict[str, Any],
+    ) -> None:
+        """
+        In SHADOW_MODE, route signals authorized by ANY regime to the
+        Synthetic Matcher for hypothetical L2 slippage and fill rate recording.
+
+        This enables the CPCV optimizer to compare actual fill quality
+        across regimes, not just posterior probabilities.
+        """
+        tri_state = decision.get("tri_state", {})
+        authorizing_regimes = [
+            name for name, r in tri_state.items() if r["decision"] == "AUTHORIZE"
+        ]
+
+        shadow_payload = {
+            **payload,
+            "signal_id": signal_id,
+            "shadow_mode": True,
+            "authorizing_regimes": authorizing_regimes,
+            "tri_state_decisions": decision.get("tri_state_decisions", {}),
+            "base_prior": decision.get("base_prior", 0.5),
+            "base_likelihood": decision.get("base_likelihood", 1.0),
+        }
+
+        try:
+            await self._pool.xadd(
+                MATCH_VALIDATION_STREAM,
+                {"payload": orjson.dumps(shadow_payload)},
+                maxlen=50000,
+                approximate=True,
+            )
+            await log.ainfo(
+                "shadow_routed_to_matcher",
+                signal_id=signal_id,
+                authorizing_regimes=authorizing_regimes,
+            )
+        except Exception as e:
+            await log.adebug("shadow_route_error", error=str(e))
 
     async def _handle_dead_letter(self, msg_id: bytes, payload: dict[str, Any]) -> None:
         """Move a signal to the Dead Letter Queue after MAX_RETRIES failures."""

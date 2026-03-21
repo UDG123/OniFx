@@ -1,8 +1,19 @@
 """
-OniQuant v6.0 — Bayesian Decision Engine (Orchestrator)
-=========================================================
+OniQuant v6.0 — Bayesian Decision Engine (Tri-State Orchestrator)
+===================================================================
 Final arbiter for all Alpha Stack signals.
-Authorizes or rejects based on Bayesian Posterior > 69.5%.
+
+Tri-State Regime Evaluation:
+    Every signal is evaluated in parallel across three risk regimes
+    (Conservative, Active, Aggressive) using Power Priors, Likelihood
+    Tempering, and regime-specific thresholds.
+
+    Power Priors:     P_regime(A) = P(A) ^ a0        (a0 ∈ [0.15, 0.80])
+    Tempering:        L_tempered  = L ^ (1/T)         (T ∈ [1.0, 2.5])
+    Threshold:        AUTHORIZE if posterior > floor   (floor ∈ [0.51, 0.70])
+
+    The active regime controls live order flow.
+    All three regimes are always logged for CPCV shadow analysis.
 
 Bayes' Theorem (Odds Form):
     posterior_odds = prior_odds × likelihood_ratio
@@ -15,10 +26,12 @@ Likelihood Multipliers:
 from __future__ import annotations
 
 import math
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 import orjson
@@ -29,6 +42,62 @@ from app.core.config import get_settings
 from app.core.database import query_win_rate
 
 log = structlog.get_logger("oniquant.orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# Risk Regime Configuration Loader
+# ---------------------------------------------------------------------------
+
+def _load_risk_profiles() -> dict[str, Any]:
+    """Load tri-state regime definitions from config/risk_profiles.yaml."""
+    try:
+        import yaml
+    except ImportError:
+        # Fallback if PyYAML not installed — use hardcoded defaults
+        return _default_risk_profiles()
+
+    config_path = Path(__file__).resolve().parents[2] / "config" / "risk_profiles.yaml"
+    if not config_path.exists():
+        return _default_risk_profiles()
+
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def _default_risk_profiles() -> dict[str, Any]:
+    """Hardcoded fallback matching config/risk_profiles.yaml."""
+    return {
+        "active_regime": "conservative",
+        "regimes": {
+            "conservative": {
+                "label": "Conservative",
+                "threshold": 0.70,
+                "prior_discount_a0": 0.80,
+                "tempering_T": 1.0,
+                "kelly_fraction": 0.10,
+                "max_cap_pct": 0.01,
+            },
+            "active": {
+                "label": "Active",
+                "threshold": 0.60,
+                "prior_discount_a0": 0.50,
+                "tempering_T": 1.5,
+                "kelly_fraction": 0.25,
+                "max_cap_pct": 0.025,
+            },
+            "aggressive": {
+                "label": "Aggressive",
+                "threshold": 0.51,
+                "prior_discount_a0": 0.15,
+                "tempering_T": 2.5,
+                "kelly_fraction": 0.50,
+                "max_cap_pct": 0.05,
+            },
+        },
+    }
+
+
+RISK_PROFILES: dict[str, Any] = _load_risk_profiles()
 
 
 # ---------------------------------------------------------------------------
@@ -74,18 +143,23 @@ ROUTING_MAP: dict[str, str] = {
 
 class BayesianArbiter:
     """
-    Bayesian decision engine with configurable likelihood multipliers.
+    Tri-State Bayesian decision engine with Power Priors and Likelihood Tempering.
 
     Pipeline per signal:
         1. Fetch Prior P(A) from TimescaleDB (30-day win rate).
         2. Compute Likelihood via IOF, Macro, Hurst adjustments.
-        3. Compute Posterior via odds-form Bayes.
-        4. AUTHORIZE if posterior > 69.5%, else REJECT.
+        3. For each regime (Conservative, Active, Aggressive):
+           a. Apply Power Prior:  P_regime = P(A) ^ a0
+           b. Apply Tempering:    L_regime = L ^ (1/T)
+           c. Compute Posterior via odds-form Bayes.
+           d. AUTHORIZE if posterior > regime threshold, else REJECT.
+        4. Return tri-state decision dict + active regime decision for routing.
     """
 
     def __init__(self, redis_pool: aioredis.Redis) -> None:
         self._redis = redis_pool
         self._settings = get_settings()
+        self._risk_profiles = RISK_PROFILES
         self._evaluated = 0
         self._authorized = 0
         self._rejected = 0
@@ -263,16 +337,95 @@ class BayesianArbiter:
         posterior_odds = prior_odds * likelihood
         return max(0.0001, min(0.9999, posterior_odds / (1.0 + posterior_odds)))
 
+    @staticmethod
+    def _apply_power_prior(prior: float, a0: float) -> float:
+        """
+        Power Prior discount: P_regime(A) = P(A) ^ a0.
+
+        a0=1.0 → full historical trust (Conservative)
+        a0=0.5 → sqrt of historical rate (Active)
+        a0=0.15 → near-flat prior (Aggressive: live data dominates)
+
+        The result is clamped to (0.05, 0.95) for numerical safety.
+        """
+        discounted = prior ** a0
+        return max(0.05, min(0.95, discounted))
+
+    @staticmethod
+    def _apply_tempering(likelihood: float, T: float) -> float:
+        """
+        Likelihood Tempering: L_tempered = L ^ (1/T).
+
+        T=1.0 → raw likelihood (Conservative: full penalty curve)
+        T=1.5 → softened curve (Active: borderline setups pass easier)
+        T=2.5 → heavily flattened (Aggressive: reduced impact of IOF/macro)
+
+        Result clamped to [0.3, 3.0] after tempering.
+        """
+        if T <= 0:
+            T = 1.0
+        tempered = likelihood ** (1.0 / T)
+        return max(0.3, min(3.0, tempered))
+
     # ------------------------------------------------------------------
-    # Evaluate Signal
+    # Tri-State Evaluation
     # ------------------------------------------------------------------
+
+    def _evaluate_regime(
+        self,
+        regime_name: str,
+        regime_cfg: dict[str, Any],
+        base_prior: float,
+        base_likelihood: float,
+        asset_class: str,
+    ) -> dict[str, Any]:
+        """
+        Evaluate a single regime against the signal.
+
+        Returns per-regime decision dict:
+            {regime, posterior, decision, threshold, power_prior, tempered_L}
+        """
+        a0 = regime_cfg.get("prior_discount_a0", 1.0)
+        T = regime_cfg.get("tempering_T", 1.0)
+        threshold = regime_cfg.get("threshold", 0.695)
+
+        # Apply Power Prior
+        regime_prior = self._apply_power_prior(base_prior, a0)
+
+        # Apply Likelihood Tempering
+        regime_likelihood = self._apply_tempering(base_likelihood, T)
+
+        # Compute posterior
+        posterior = self._compute_posterior(regime_prior, regime_likelihood)
+
+        # Decision
+        decision = Decision.AUTHORIZE if posterior > threshold else Decision.REJECT
+
+        return {
+            "regime": regime_name,
+            "label": regime_cfg.get("label", regime_name),
+            "posterior": round(posterior, 6),
+            "decision": decision.value,
+            "threshold": threshold,
+            "power_prior": round(regime_prior, 6),
+            "tempered_L": round(regime_likelihood, 6),
+            "a0": a0,
+            "T": T,
+            "kelly_fraction": regime_cfg.get("kelly_fraction", 0.25),
+            "max_cap_pct": regime_cfg.get("max_cap_pct", 0.025),
+        }
 
     async def evaluate(self, signal: dict[str, Any]) -> dict[str, Any]:
         """
-        Full Bayesian evaluation of a signal.
+        Full Tri-State Bayesian evaluation of a signal.
 
-        Returns the decision object:
-            {signal_id, posterior_probability, decision, routing_target, reasoning_math}
+        Evaluates all three regimes in parallel and returns the
+        active regime's decision for routing, plus the full tri-state
+        audit log for shadow analysis and CPCV optimization.
+
+        Returns:
+            {signal_id, posterior_probability, decision, routing_target,
+             reasoning_math, tri_state, active_regime}
         """
         signal_id = signal.get("signal_id", str(uuid.uuid4()))
         asset_symbol = signal.get("asset_symbol", "UNKNOWN")
@@ -280,14 +433,14 @@ class BayesianArbiter:
         desk_id = signal.get("desk_id", "unknown")
         direction = signal.get("signal_direction", 1)
 
-        # Step 1: Prior
-        prior = await self._fetch_prior(asset_symbol, desk_id)
+        # Step 1: Prior (shared base across regimes)
+        base_prior = await self._fetch_prior(asset_symbol, desk_id)
 
         # Step 2: Macro
         macro = await self._fetch_macro()
 
-        # Step 3: Likelihood
-        likelihood, reasoning = self._compute_likelihood(
+        # Step 3: Base Likelihood (shared — regimes apply tempering on top)
+        base_likelihood, reasoning = self._compute_likelihood(
             iof_strength=signal.get("iof_strength", 0.5),
             macro=macro,
             hurst=signal.get("hurst_exponent", 0.5),
@@ -296,12 +449,25 @@ class BayesianArbiter:
             asset_class=asset_class,
         )
 
-        # Step 4: Posterior
-        posterior = self._compute_posterior(prior, likelihood)
+        # Step 4: Tri-State parallel evaluation
+        regimes = self._risk_profiles.get("regimes", {})
+        active_regime_name = self._risk_profiles.get("active_regime", "conservative")
 
-        # Step 5: Decision
-        floor = self._settings.posterior_floor
-        if posterior > floor:
+        tri_state: dict[str, dict[str, Any]] = {}
+        for regime_name, regime_cfg in regimes.items():
+            tri_state[regime_name] = self._evaluate_regime(
+                regime_name, regime_cfg, base_prior, base_likelihood, asset_class,
+            )
+
+        # Step 5: Active regime controls routing
+        active_result = tri_state.get(active_regime_name)
+        if active_result is None:
+            # Fallback to conservative if active regime not found
+            active_result = tri_state.get("conservative", next(iter(tri_state.values())))
+            active_regime_name = active_result["regime"]
+
+        posterior = active_result["posterior"]
+        if active_result["decision"] == "AUTHORIZE":
             decision = Decision.AUTHORIZE
             routing = ROUTING_MAP.get(asset_class.lower())
             self._authorized += 1
@@ -312,26 +478,59 @@ class BayesianArbiter:
 
         self._evaluated += 1
 
-        math_str = f"P(A)={prior:.4f} × L={likelihood:.4f} → P(A|B)={posterior:.6f} {'>' if posterior > floor else '≤'} {floor}"
+        # Build reasoning string
+        regime_summary = " | ".join(
+            f"{r['label']}:{r['decision']}(P={r['posterior']:.4f}>{r['threshold']})"
+            for r in tri_state.values()
+        )
+        math_str = (
+            f"P(A)={base_prior:.4f} × L={base_likelihood:.4f} "
+            f"→ [{regime_summary}] "
+            f"ACTIVE={active_regime_name}:P(A|B)={posterior:.6f}"
+        )
         full_reasoning = f"{math_str} [{reasoning}]"
+
+        # Tri-state decision map for audit log
+        tri_state_decisions = {
+            r["label"]: r["decision"] for r in tri_state.values()
+        }
+
+        # Check if ANY regime authorized (for shadow mode routing)
+        any_authorized = any(r["decision"] == "AUTHORIZE" for r in tri_state.values())
 
         output = {
             "signal_id": signal_id,
-            "posterior_probability": round(posterior, 6),
+            "posterior_probability": posterior,
             "decision": decision.value,
             "routing_target": routing,
             "reasoning_math": full_reasoning,
+            "tri_state": tri_state,
+            "tri_state_decisions": tri_state_decisions,
+            "any_regime_authorized": any_authorized,
+            "active_regime": active_regime_name,
+            "base_prior": round(base_prior, 6),
+            "base_likelihood": round(base_likelihood, 6),
         }
 
         await log.ainfo(
-            "bayesian_decision",
+            "bayesian_tri_state_decision",
             signal_id=signal_id,
             symbol=asset_symbol,
-            posterior=round(posterior, 6),
-            decision=decision.value,
+            active_regime=active_regime_name,
+            active_posterior=posterior,
+            active_decision=decision.value,
+            tri_state_decisions=tri_state_decisions,
         )
 
         return output
+
+    def reload_risk_profiles(self) -> None:
+        """Hot-reload risk profiles from YAML (called by dashboard deploy)."""
+        self._risk_profiles = _load_risk_profiles()
+
+    @property
+    def active_regime(self) -> str:
+        return self._risk_profiles.get("active_regime", "conservative")
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -341,4 +540,5 @@ class BayesianArbiter:
             "authorized": self._authorized,
             "rejected": self._rejected,
             "auth_rate": round(self._authorized / total, 4),
+            "active_regime": self.active_regime,
         }

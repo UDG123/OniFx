@@ -1,0 +1,67 @@
+# ==========================================================================
+# OniQuant v6.0 — Tri-State Risk Regime Configuration
+# ==========================================================================
+# Defines three operational states for the Bayesian Arbiter.
+# Each regime applies Power Priors, Likelihood Tempering, and
+# Fractional Kelly sizing independently — evaluated in parallel.
+#
+# Power Priors (prior_discount_a0):
+#   P_regime(A) = P(A) ^ a0
+#   a0=1.0 → full trust in historical win rate
+#   a0=0.15 → near-flat prior (aggressive: let live data dominate)
+#
+# Likelihood Tempering (tempering_T):
+#   L_tempered = L ^ (1/T)
+#   T=1.0 → raw likelihood (conservative: full penalty curve)
+#   T=2.5 → flattened likelihood (aggressive: reduced impact)
+#
+# Kelly Sizing (kelly_fraction):
+#   f_position = kelly_fraction × f*_kelly
+#   0.10 → 10% of Kelly (conservative)
+#   0.50 → 50% of Kelly (aggressive, still sub-Kelly safe)
+#
+# Capital Cap (max_cap_pct):
+#   Hard ceiling on any single position as % of NLV.
+#
+# active_regime: which regime controls LIVE order flow.
+# All three regimes are ALWAYS evaluated for shadow logging.
+# ==========================================================================
+
+active_regime: "conservative"
+
+regimes:
+  conservative:
+    label: "Conservative"
+    threshold: 0.70
+    prior_discount_a0: 0.80
+    tempering_T: 1.0
+    kelly_fraction: 0.10
+    max_cap_pct: 0.01
+    description: >
+      Default safe state. Full penalty curve, tight threshold,
+      10% Kelly sizing, 1% capital cap per position. Suitable for
+      Monday opens, high-VIX environments, or post-drawdown recovery.
+
+  active:
+    label: "Active"
+    threshold: 0.60
+    prior_discount_a0: 0.50
+    tempering_T: 1.5
+    kelly_fraction: 0.25
+    max_cap_pct: 0.025
+    description: >
+      Standard operating state. Moderate prior discount lets live
+      signals weigh heavier, tempering softens penalty curve for
+      borderline setups. 25% Kelly with 2.5% cap.
+
+  aggressive:
+    label: "Aggressive"
+    threshold: 0.51
+    prior_discount_a0: 0.15
+    tempering_T: 2.5
+    kelly_fraction: 0.50
+    max_cap_pct: 0.05
+    description: >
+      High-conviction state. Near-flat priors, heavily flattened
+      penalty curve, 50% Kelly. Only activate when CPCV shows
+      Deflated Sharpe > 2.0 and PBO < 10% for this regime.
