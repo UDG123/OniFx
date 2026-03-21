@@ -1,0 +1,75 @@
+# ==========================================================================
+# OniQuant v6.0 — Asset Universe Configuration
+# ==========================================================================
+# Single source of truth for all desk subscriptions.
+# Workers pull their symbol lists from this file.
+# ==========================================================================
+
+desks:
+  scalper_spx:
+    name: "SPX Scalper"
+    broker: "IBKR_TWS"
+    asset_class: "equity"
+    symbols:
+      - SPY
+      - QQQ
+    timeframe: "1m"
+
+  scalper_fx:
+    name: "FX Scalper"
+    broker: "IBKR_TWS"
+    asset_class: "forex"
+    symbols:
+      - EURUSD
+      - GBPUSD
+      - USDJPY
+    timeframe: "1m"
+
+  swing_tech:
+    name: "Tech Swing"
+    broker: "IBKR_TWS"
+    asset_class: "equity"
+    symbols:
+      - AAPL
+      - MSFT
+      - NVDA
+      - TSLA
+    timeframe: "5m"
+
+  macro_metals:
+    name: "Macro Metals"
+    broker: "IBKR_TWS"
+    asset_class: "metals"
+    symbols:
+      - GC_F
+      - SI_F
+    timeframe: "5m"
+
+  alts_major:
+    name: "Crypto Majors"
+    broker: "BYBIT_V5"
+    asset_class: "perpetual"
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+    timeframe: "1m"
+
+  alts_mid:
+    name: "Crypto Mid-Caps"
+    broker: "BYBIT_V5"
+    asset_class: "perpetual"
+    symbols:
+      - SOLUSDT
+      - AVAXUSDT
+      - ARBUSDT
+    timeframe: "1m"
+
+# Global settings
+defaults:
+  wfo_lookback_days: 30
+  wfo_is_days: 21
+  wfo_oos_days: 7
+  posterior_floor: 0.695
+  adverse_selection_penalty: 0.20
+  max_daily_drawdown: 0.03
+  max_slippage_pct: 0.005
