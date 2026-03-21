@@ -22,6 +22,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # Allow worker-specific env vars (MATCH_STREAM_MAXLEN, etc.)
     )
 
     # --- Application ---

@@ -199,26 +199,33 @@ def evaluate_l2_fill(
             reason="no_liquidity_at_price",
         )
 
-    # --- Walk through levels, accumulating volume ---
+    # --- Walk through levels, accumulating TOTAL available volume ---
+    # We track two volumes:
+    #   cumulative_volume: total resting size at/through the price (uncapped)
+    #   vwap_consumed: capped consumption for VWAP fill price calculation
     cumulative_volume = 0.0
     vwap_numerator = 0.0
+    vwap_consumed = 0.0
     depth = 0
-    remaining = required_volume
+    remaining_for_vwap = required_volume
 
     for lvl in levels:
         depth += 1
-        consumed = min(lvl.size, remaining)
-        cumulative_volume += consumed
+        cumulative_volume += lvl.size  # full level size (uncapped)
+
+        # For VWAP: only consume what we need
+        consumed = min(lvl.size, max(0.0, remaining_for_vwap))
+        vwap_consumed += consumed
         vwap_numerator += lvl.price * consumed
-        remaining -= consumed
-        if remaining <= 0:
-            break
+        remaining_for_vwap -= consumed
 
     # --- Fill determination ---
+    # The order fills IFF total resting volume exceeds the required volume
+    # (order size + 20% adverse selection buffer)
     filled = cumulative_volume > required_volume
 
     # --- VWAP fill price ---
-    fill_price = (vwap_numerator / cumulative_volume) if cumulative_volume > 0 else price
+    fill_price = (vwap_numerator / vwap_consumed) if vwap_consumed > 0 else price
 
     elapsed = (time.perf_counter() - t0) * 1000
 
