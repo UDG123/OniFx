@@ -382,12 +382,29 @@ class BayesianArbiter:
         """
         Evaluate a single regime against the signal.
 
+        Selection Bias Guard:
+            For regimes with a0 < 0.30 (e.g., AGGRESSIVE), the flat power
+            prior makes historical win rate nearly irrelevant. To prevent
+            authorizing assets with genuinely poor track records purely on
+            live momentum, a minimum base prior floor of 0.40 is enforced.
+            If the raw historical win rate is below 40%, the regime REJECTS
+            regardless of posterior — this is a structural safeguard against
+            selection bias, not a Bayesian one.
+
         Returns per-regime decision dict:
             {regime, posterior, decision, threshold, power_prior, tempered_L}
         """
         a0 = regime_cfg.get("prior_discount_a0", 1.0)
         T = regime_cfg.get("tempering_T", 1.0)
         threshold = regime_cfg.get("threshold", 0.695)
+
+        # ── Selection Bias Guard ──────────────────────────────────
+        # Flat-prior regimes (a0 < 0.30) can authorize signals from
+        # assets with terrible historical win rates. Require base
+        # prior >= 0.40 to prevent structural selection bias.
+        selection_bias_blocked = False
+        if a0 < 0.30 and base_prior < 0.40:
+            selection_bias_blocked = True
 
         # Apply Power Prior
         regime_prior = self._apply_power_prior(base_prior, a0)
@@ -398,8 +415,11 @@ class BayesianArbiter:
         # Compute posterior
         posterior = self._compute_posterior(regime_prior, regime_likelihood)
 
-        # Decision
-        decision = Decision.AUTHORIZE if posterior > threshold else Decision.REJECT
+        # Decision (with selection bias override)
+        if selection_bias_blocked:
+            decision = Decision.REJECT
+        else:
+            decision = Decision.AUTHORIZE if posterior > threshold else Decision.REJECT
 
         return {
             "regime": regime_name,
@@ -413,6 +433,7 @@ class BayesianArbiter:
             "T": T,
             "kelly_fraction": regime_cfg.get("kelly_fraction", 0.25),
             "max_cap_pct": regime_cfg.get("max_cap_pct", 0.025),
+            "selection_bias_blocked": selection_bias_blocked,
         }
 
     async def evaluate(self, signal: dict[str, Any]) -> dict[str, Any]:
