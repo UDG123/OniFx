@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     bybit_api_secret: str = ""
     bybit_testnet: bool = True
 
+    # --- Static Egress IP (Railway / Proxy) ---
+    # IBKR requires whitelisted egress IPs in Account Management portal.
+    # Bybit V5 API keys can be bound to specific IPs for security.
+    # On Railway.app: use the "Static Outbound IPs" add-on and set this.
+    # On Docker: use SOCKS5_PROXY or the egress-proxy sidecar container.
+    static_egress_ip: str = ""               # e.g., "203.0.113.42"
+    socks5_proxy: str = ""                   # e.g., "socks5://proxy:1080"
+    egress_proxy_enabled: bool = False
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

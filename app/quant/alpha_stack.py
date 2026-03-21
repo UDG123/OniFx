@@ -17,7 +17,6 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import CubicSpline
-from scipy.spatial.distance import mahalanobis
 from sklearn.covariance import LedoitWolf
 
 import structlog

@@ -76,7 +76,16 @@ class TokenBucketLimiter:
 
 class IBKRConnector:
     """
-    IB Gateway connector with rate limiting and synthetic order registration.
+    IB Gateway connector with rate limiting, egress IP validation,
+    and synthetic order registration.
+
+    Static IP Requirements:
+        IBKR requires all API connections to originate from IPs whitelisted
+        in Account Management → Settings → API → Trusted IPs. Connections
+        from unknown IPs are silently rejected with no error message.
+
+        This connector validates egress IP on connect() and logs a warning
+        if the detected IP doesn't match the configured static_egress_ip.
 
     Lifecycle: connect() → register_simulated_order() / request_l2() → disconnect()
     """
@@ -90,9 +99,57 @@ class IBKRConnector:
         )
         self._redis: aioredis.Redis | None = None
 
+    async def _validate_egress_ip(self) -> str | None:
+        """
+        Detect our public egress IP and compare against the configured
+        static_egress_ip. Logs a CRITICAL warning on mismatch because
+        IBKR will silently reject connections from non-whitelisted IPs.
+
+        Returns the detected egress IP, or None if detection fails.
+        """
+        expected = self._settings.static_egress_ip
+        if not expected:
+            await log.awarning(
+                "ibkr_no_static_ip_configured",
+                hint="Set STATIC_EGRESS_IP to enable IP validation. "
+                     "IBKR requires whitelisted IPs in Account Management.",
+            )
+            return None
+
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://api.ipify.org?format=json")
+                detected = resp.json().get("ip", "unknown")
+        except Exception as e:
+            await log.awarning("egress_ip_detection_failed", error=str(e))
+            return None
+
+        if detected != expected:
+            await log.acritical(
+                "ibkr_egress_ip_mismatch",
+                expected=expected,
+                detected=detected,
+                action="IBKR will REJECT this connection. "
+                       "Update Account Management → API → Trusted IPs, "
+                       "or fix STATIC_EGRESS_IP / proxy configuration.",
+            )
+        else:
+            await log.ainfo("ibkr_egress_ip_validated", ip=detected)
+
+        return detected
+
     async def connect(self, redis_pool: aioredis.Redis) -> None:
-        """Connect to IB Gateway and bind Redis pool."""
+        """
+        Connect to IB Gateway and bind Redis pool.
+
+        Validates egress IP before connecting. If a SOCKS5 proxy is
+        configured, the IBeam container routes through it for fixed egress.
+        """
         self._redis = redis_pool
+
+        # Validate egress IP against IBKR whitelist expectation
+        await self._validate_egress_ip()
 
         await self._ib.connectAsync(
             host=self._settings.ib_gateway_host,
@@ -105,6 +162,7 @@ class IBKRConnector:
             host=self._settings.ib_gateway_host,
             port=self._settings.ib_gateway_port,
             accounts=self._ib.managedAccounts(),
+            egress_proxy=self._settings.socks5_proxy or "direct",
         )
 
     async def disconnect(self) -> None:

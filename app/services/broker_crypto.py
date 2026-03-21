@@ -48,9 +48,57 @@ class BybitConnector:
         self._running: bool = False
         self._tasks: list[asyncio.Task] = []
 
+    async def _validate_egress_ip(self) -> str | None:
+        """
+        Detect public egress IP and compare against the configured
+        static_egress_ip. Bybit V5 API keys can be bound to specific IPs —
+        requests from non-bound IPs receive HTTP 403 (IP_NOT_ALLOWED).
+
+        Returns the detected egress IP, or None if detection fails.
+        """
+        expected = self._settings.static_egress_ip
+        if not expected:
+            await log.awarning(
+                "bybit_no_static_ip_configured",
+                hint="Set STATIC_EGRESS_IP for API key IP binding validation. "
+                     "Bybit returns 403 for requests from non-bound IPs.",
+            )
+            return None
+
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://api.ipify.org?format=json")
+                detected = resp.json().get("ip", "unknown")
+        except Exception as e:
+            await log.awarning("egress_ip_detection_failed", error=str(e))
+            return None
+
+        if detected != expected:
+            await log.acritical(
+                "bybit_egress_ip_mismatch",
+                expected=expected,
+                detected=detected,
+                action="Bybit API will return 403 IP_NOT_ALLOWED. "
+                       "Update API key IP binding at bybit.com/app/user/api-management, "
+                       "or fix STATIC_EGRESS_IP / proxy configuration.",
+            )
+        else:
+            await log.ainfo("bybit_egress_ip_validated", ip=detected)
+
+        return detected
+
     async def connect(self, redis_pool: aioredis.Redis) -> None:
-        """Initialize Bybit REST, WebSocket, and bind Redis pool."""
+        """
+        Initialize Bybit REST, WebSocket, and bind Redis pool.
+
+        Validates egress IP against Bybit API key IP binding.
+        If SOCKS5 proxy is configured, pybit routes through it.
+        """
         self._redis = redis_pool
+
+        # Validate egress IP against Bybit API key IP binding
+        await self._validate_egress_ip()
 
         self._http = BybitHTTP(
             api_key=self._settings.bybit_api_key,
@@ -63,7 +111,11 @@ class BybitConnector:
             channel_type="linear",
         )
 
-        await log.ainfo("bybit_connected", testnet=self._settings.bybit_testnet)
+        await log.ainfo(
+            "bybit_connected",
+            testnet=self._settings.bybit_testnet,
+            egress_proxy=self._settings.socks5_proxy or "direct",
+        )
 
     async def disconnect(self) -> None:
         self._running = False

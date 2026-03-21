@@ -117,6 +117,21 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # --- Egress Proxy (Static IP for Broker Whitelisting) ---
+  # Routes all broker-bound traffic through a SOCKS5 proxy
+  # so that IBKR and Bybit see a consistent, whitelisted IP.
+  # Only needed when EGRESS_PROXY_ENABLED=true.
+  egress-proxy:
+    image: serjs/go-socks5-proxy:latest
+    ports:
+      - "1080:1080"
+    environment:
+      PROXY_USER: oniquant
+      PROXY_PASSWORD: ${EGRESS_PROXY_PASSWORD:-changeme}
+    restart: unless-stopped
+    profiles:
+      - egress  # Only starts with: docker-compose --profile egress up
+
 volumes:
   redis_data:
   timescale_data:
