@@ -29,6 +29,7 @@ import structlog
 
 from app.core.config import get_settings
 from app.core.database import init_pool, insert_signal
+from app.core.kill_switch import is_kill_switch_active
 from app.services.orchestrator import BayesianArbiter
 
 log = structlog.get_logger("oniquant.orchestration_worker")
@@ -40,6 +41,27 @@ CONSUMER_NAME: str = os.getenv("CONSUMER_NAME", f"orch_worker_{os.getpid()}")
 PENDING_ZSET: str = "oniquant:pending_trades"
 DLQ_STREAM: str = "oniquant:dead_letter_queue"
 MAX_RETRIES: int = 3
+
+# ---------------------------------------------------------------------------
+# Lua Script: Atomic XACK + ZADD
+# ---------------------------------------------------------------------------
+# Guarantees that acknowledging a message and adding the trade to the
+# pending ZSET happen as a single atomic operation. If the worker crashes
+# mid-execution, Redis either completes BOTH or NEITHER — eliminating
+# the ghost-trade duplication vector from the Red Team audit (CRITICAL-02).
+#
+# KEYS[1] = input stream    (oniquant:raw_signals)
+# KEYS[2] = consumer group  (orchestrator_cg)
+# KEYS[3] = pending ZSET    (oniquant:pending_trades)
+# ARGV[1] = message ID      (e.g., "1679000000000-0")
+# ARGV[2] = ZSET member     (orjson-encoded trade payload bytes)
+# ARGV[3] = ZSET score      (expiry timestamp as string)
+# ---------------------------------------------------------------------------
+LUA_ATOMIC_ACK_AND_ROUTE = """
+redis.call('XACK', KEYS[1], KEYS[2], ARGV[1])
+redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
+return 1
+"""
 
 
 class OrchestrationWorker:
@@ -63,6 +85,7 @@ class OrchestrationWorker:
         self._running: bool = False
         self._processed: int = 0
         self._retry_counts: dict[str, int] = {}
+        self._atomic_ack_route: Any | None = None  # registered Lua script
 
     async def connect(self) -> None:
         self._pool = aioredis.from_url(
@@ -81,6 +104,9 @@ class OrchestrationWorker:
             await log.awarning("db_init_deferred", error=str(e))
 
         self._arbiter = BayesianArbiter(self._pool)
+
+        # Register Lua script for atomic XACK + ZADD (CRITICAL-02 fix)
+        self._atomic_ack_route = self._pool.register_script(LUA_ATOMIC_ACK_AND_ROUTE)
 
         # Create consumer group (idempotent)
         try:
@@ -104,9 +130,30 @@ class OrchestrationWorker:
         """
         Process a single signal through the pipeline.
 
+        Kill Switch Gate (CRITICAL-01 fix):
+            Checked before ANY authorization to ensure halted state
+            is respected even for signals already in the stream.
+
+        Atomic ACK+ZADD (CRITICAL-02 fix):
+            AUTHORIZED signals are routed via a Lua script that performs
+            XACK and ZADD as a single atomic Redis operation, eliminating
+            the ghost-trade duplication vector on crash recovery.
+
         Returns True if successfully processed, False on error.
         """
         signal_id = payload.get("signal_id", str(uuid.uuid4()))
+
+        # ── Kill Switch Gate ──────────────────────────────────────
+        if await is_kill_switch_active(self._pool):
+            await log.acritical(
+                "kill_switch_blocked_signal",
+                signal_id=signal_id,
+                symbol=payload.get("asset_symbol"),
+            )
+            # ACK the message so it doesn't re-enter the pipeline,
+            # but do NOT route it — the signal is silently dropped.
+            await self._pool.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
+            return True
 
         # Step 1: Enrich — pull live WFO params from Redis
         desk_id = payload.get("desk_id", "luxalgo")
@@ -118,7 +165,7 @@ class OrchestrationWorker:
         decision = await self._arbiter.evaluate(payload)
 
         if decision["decision"] == "AUTHORIZE":
-            # Step 3a: Push to pending_trades ZSET for Memory Engine
+            # Step 3a: Atomic XACK + ZADD via Lua script (CRITICAL-02)
             now = time.time()
             ttl = payload.get("ttl_seconds", 300)
             expiry = now + ttl
@@ -131,12 +178,12 @@ class OrchestrationWorker:
                 "authorized_at": now,
             }
 
-            await self._pool.zadd(
-                PENDING_ZSET,
-                {orjson.dumps(trade_payload): expiry},
+            await self._atomic_ack_route(
+                keys=[INPUT_STREAM, CONSUMER_GROUP, PENDING_ZSET],
+                args=[msg_id, orjson.dumps(trade_payload), str(expiry)],
             )
         else:
-            # Step 3b: Log rejected signal to TimescaleDB
+            # Step 3b: Log rejected signal to TimescaleDB, then ACK
             try:
                 await insert_signal(
                     ts=datetime.now(timezone.utc),
@@ -153,6 +200,10 @@ class OrchestrationWorker:
                 )
             except Exception as e:
                 await log.awarning("reject_log_error", error=str(e))
+
+            # ACK rejected signals (non-atomic is safe — reprocessing
+            # a rejection is idempotent and produces no trade)
+            await self._pool.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
 
         self._processed += 1
         return True
@@ -238,9 +289,10 @@ class OrchestrationWorker:
                         try:
                             raw = msg_data.get(b"payload", b"{}")
                             payload = orjson.loads(raw)
-                            success = await self._process_signal(msg_id, payload)
-                            if success:
-                                await self._pool.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
+                            # XACK is now handled atomically inside
+                            # _process_signal (via Lua for AUTHORIZE,
+                            # via explicit call for REJECT/kill-switch).
+                            await self._process_signal(msg_id, payload)
                         except Exception as e:
                             await log.aerror(
                                 "signal_processing_error",

@@ -26,6 +26,8 @@ import orjson
 import redis.asyncio as aioredis
 import structlog
 
+from app.core.kill_switch import is_kill_switch_active
+
 # ---------------------------------------------------------------------------
 # Logger
 # ---------------------------------------------------------------------------
@@ -175,10 +177,21 @@ class TradeMemoryEngine:
         """
         Scan non-expired pending trades and check price crossings.
 
+        Kill Switch Gate (CRITICAL-01 fix):
+            If the global kill switch is active, skip ALL price checks
+            and promotions. Pending signals remain in the ZSET and will
+            either expire naturally or be promoted after deactivation.
+
         Fetches up to BATCH_SIZE entries with score > now (still alive),
         checks each against current market price, and promotes to the
         match_validation stream if the target is hit.
         """
+        # ── Kill Switch Gate ──────────────────────────────────────
+        if await is_kill_switch_active(self._pool):
+            if self._cycles % 100 == 0:  # throttle log noise
+                await log.acritical("kill_switch_blocking_promotions")
+            return
+
         # Fetch pending trades that haven't expired yet
         pending: list[tuple[bytes, float]] = await self._pool.zrangebyscore(
             PENDING_ZSET,

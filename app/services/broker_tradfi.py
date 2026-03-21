@@ -22,6 +22,7 @@ import structlog
 from ib_async import IB, Contract, LimitOrder, MarketOrder, Order, Trade
 
 from app.core.config import get_settings
+from app.core.kill_switch import is_kill_switch_active
 
 log: structlog.stdlib.BoundLogger = structlog.get_logger("oniquant.broker.tradfi")
 
@@ -243,6 +244,15 @@ class IBKRConnector:
         return order_id
 
     async def place_order(self, contract: Contract, order: Order) -> Trade:
-        """Place a real order via IB Gateway (rate-limited)."""
+        """Place a real order via IB Gateway (rate-limited, kill-switch guarded)."""
+        if self._redis and await is_kill_switch_active(self._redis):
+            await log.acritical(
+                "kill_switch_blocked_order",
+                symbol=contract.symbol,
+                action=order.action,
+                quantity=order.totalQuantity,
+            )
+            raise RuntimeError("Global kill switch is ACTIVE — order blocked")
+
         await self._limiter.acquire()
         return self._ib.placeOrder(contract, order)

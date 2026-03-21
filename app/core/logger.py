@@ -98,7 +98,17 @@ async def send_alert(
 # Pre-built Alert Functions
 # ---------------------------------------------------------------------------
 
-async def alert_kill_switch(reason: str, drawdown: float) -> None:
+async def alert_kill_switch(
+    reason: str,
+    drawdown: float,
+    redis: Any | None = None,
+) -> None:
+    # Activate the Redis-backed kill switch BEFORE sending alerts,
+    # so order flow is halted even if the webhook dispatch fails.
+    if redis is not None:
+        from app.core.kill_switch import activate_global_kill_switch
+        await activate_global_kill_switch(redis, reason=reason)
+
     await send_alert(
         title="GLOBAL KILL SWITCH ACTIVATED",
         message=f"All authorizations halted. Reason: {reason}",
