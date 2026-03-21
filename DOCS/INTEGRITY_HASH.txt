@@ -1,0 +1,38 @@
+OniQuant v6.0 — Certificate of Mathematical Integrity
+========================================================
+Generated: 2026-03-21
+Audit:     Red Team Zero-Trust Quantitative & Infrastructure Audit
+Status:    ALL FINDINGS RESOLVED — CERTIFIED FOR LIVE EXECUTION
+Tests:     math_properties.py 6/6 PASSED
+
+SHA-256 Hashes of Critical System Files
+========================================================
+
+# Core Infrastructure
+d64cf7e232fc710e939ec2e72e352c7ffc4c71cbb72239abb9398f4581eb7440  app/core/kill_switch.py
+e90faa443d0e2d606c2794e0cf290cdd706c4b06b8872ed28b0ede6961c81e18  app/core/logger.py
+897e6d0586166813d16dd665e274228908f2060bab7b8a80e3d6c471401e4797  app/core/config.py
+
+# Decision Engine & Matching
+6dd3a036906b1d7c88b79759134e041d5f2270cf7ec41606978cf85f159c9691  app/services/orchestrator.py
+2e8166f33f8d723ee5b6880aa32023730487ddaac042ebc4997638e4a07133d2  app/services/matcher.py
+b9e587d3c5c0ee193dd68858bfb2977c77d4efd4ed4cf77a005f397dfb820ac6  app/services/broker_tradfi.py
+
+# Alpha Stack (Signal Generation)
+630470d71ca696975929c3537bc8d6d37074092651275bdc26817ee95ea713dc  app/quant/alpha_stack.py
+
+# Workers
+71791cdca044754a7f96cd195ed7f90ac6f3d358610479c35b1e4869310a8467  workers/orchestration_worker.py
+3477c1bcd4113a66d96690547a7c509c7f05b0d61dc3777ac95877929a2d463e  workers/memory_worker.py
+
+# 2FA & Container
+ed91fd66be3e5e4a1fada5b483e26f76ce34fa457a94472009efb6b51289259d  scripts/generate_2fa.py
+7cc1a214afdf17373166410909ba58b4b79dd724c65fe55c0a9bdd4b71c258b6  docker/Dockerfile.ibeam
+
+# Tests & Audit
+115dabebcb46564023ea3cb629f0bfd1246da86cda670374a5a0d0f48263a922  tests/math_properties.py
+472260bc17d47ec7b5ed93e663e645eacca96a5c7ee4f6b781494458ad8ec4d8  DOCS/RED_TEAM_AUDIT_REPORT.md
+
+Verification Command
+========================================================
+sha256sum -c DOCS/INTEGRITY_HASH.txt

@@ -36,6 +36,9 @@ from app.core.database import log_simulated_fill
 
 log: structlog.stdlib.BoundLogger = structlog.get_logger("oniquant.matcher")
 
+# Maximum age (seconds) of an L2 snapshot before it's considered stale (STAB-01).
+MAX_L2_SNAPSHOT_AGE: float = 1.0  # 1000ms
+
 
 # ---------------------------------------------------------------------------
 # 1. L2 Data Structures
@@ -132,6 +135,7 @@ def evaluate_l2_fill(
     l2_snapshot: list[dict[str, Any]],
     direction: int = 1,
     penalty_ratio: float | None = None,
+    vix_regime: str = "normal",
 ) -> FillResult:
     """
     Evaluate whether an order would fill against an L2 orderbook.
@@ -151,6 +155,11 @@ def evaluate_l2_fill(
     │      • Adverse selection: informed flow fills against you       │
     │      • Partial cancels: some queue participants withdraw        │
     │                                                                 │
+    │    Adaptive α (STAB-02 fix):                                   │
+    │      normal   → 0.20 (default)                                  │
+    │      elevated → 0.30 (VIX 25-35)                               │
+    │      extreme  → 0.35 (VIX > 35)                                │
+    │                                                                 │
     │    Fill Price = VWAP across consumed levels:                    │
     │      P_fill = Σ(P_i × min(V_i, remaining)) / V_consumed       │
     └─────────────────────────────────────────────────────────────────┘
@@ -161,6 +170,7 @@ def evaluate_l2_fill(
         l2_snapshot: List of L2 level dicts from broker connectors.
         direction: 1 = BUY (aggress into asks), -1 = SELL (aggress into bids).
         penalty_ratio: Override adverse selection penalty (default from config).
+        vix_regime: Market volatility regime ("normal", "elevated", "extreme").
 
     Returns:
         FillResult with fill determination, VWAP, latency, and diagnostics.
@@ -170,8 +180,30 @@ def evaluate_l2_fill(
     if penalty_ratio is None:
         penalty_ratio = get_settings().adverse_selection_penalty
 
+    # ── Adaptive Adverse Selection (STAB-02 fix) ─────────────
+    # Scale the penalty based on market volatility regime.
+    if vix_regime == "elevated":
+        penalty_ratio = max(penalty_ratio, 0.30)
+    elif vix_regime == "extreme":
+        penalty_ratio = max(penalty_ratio, 0.35)
+
     # --- Parse L2 snapshot ---
     l2 = L2Snapshot.from_raw(l2_snapshot)
+
+    # ── L2 Staleness Validation (STAB-01 fix) ────────────────
+    snapshot_age = time.time() - l2.timestamp
+    if snapshot_age > MAX_L2_SNAPSHOT_AGE:
+        elapsed = (time.perf_counter() - t0) * 1000
+        return FillResult(
+            filled=False,
+            simulated_fill_price=price,
+            latency_ms=round(elapsed, 3),
+            cumulative_volume=0.0,
+            required_volume=0.0,
+            queue_depth=0,
+            adverse_buffer=0.0,
+            reason=f"MISS:STALE_DATA snapshot_age={snapshot_age:.3f}s > {MAX_L2_SNAPSHOT_AGE}s",
+        )
 
     # --- Compute required volume with adverse selection buffer ---
     adverse_buffer = order_size * penalty_ratio
