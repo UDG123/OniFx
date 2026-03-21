@@ -1,0 +1,122 @@
+version: "3.9"
+
+# ==========================================================================
+# OniQuant v6.0 — Docker Compose (Local Development)
+# ==========================================================================
+# Services: API, Redis Stack, TimescaleDB, Memory Worker, Orchestration Worker
+# ==========================================================================
+
+services:
+
+  # --- FastAPI Ingestion API ---
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://oniquant:oniquant@timescaledb:5432/oniquant
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --loop uvloop
+      --http httptools
+      --workers 1
+    restart: unless-stopped
+
+  # --- Memory Worker (Trade Memory Engine) ---
+  memory-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python -m workers.memory_worker
+    restart: unless-stopped
+
+  # --- Orchestration Worker (Bayesian Decision Engine) ---
+  orchestration-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://oniquant:oniquant@timescaledb:5432/oniquant
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    command: python -m workers.orchestration_worker
+    restart: unless-stopped
+
+  # --- IBeam / IB Gateway (Headless TradFi) ---
+  ibeam-gateway:
+    image: voyz/ibeam:latest
+    ports:
+      - "5000:5000"    # IBeam management API
+      - "4001:4001"    # IB Gateway paper trading
+    env_file: .env
+    environment:
+      IBEAM_ACCOUNT: ${IBKR_USER:-}
+      IBEAM_PASSWORD: ${IBKR_PASSWORD:-}
+      IBEAM_GATEWAY_TYPE: paper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/v1/api/tickle"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # --- Redis Stack (Streams + Insight) ---
+  redis:
+    image: redis/redis-stack:latest
+    ports:
+      - "6379:6379"
+      - "8001:8001"    # RedisInsight UI
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- TimescaleDB (PostgreSQL + Hypertables) ---
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: oniquant
+      POSTGRES_USER: oniquant
+      POSTGRES_PASSWORD: oniquant
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./schema/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oniquant -d oniquant"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  timescale_data:
