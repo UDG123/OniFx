@@ -1,0 +1,20 @@
+# OniQuant v6.0 — High-Performance ASGI Ingestion Stack
+# Pinned for deterministic Railway.app builds
+
+# --- Core ASGI Framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0      # Includes uvloop + httptools as extras
+
+# --- Performance-Critical Dependencies ---
+uvloop==0.21.0                 # libuv-based event loop (2-4x asyncio throughput)
+httptools==0.6.4               # llhttp-based HTTP parsing (replaces h11)
+orjson==3.10.13                # SIMD-accelerated JSON (de)serialization
+
+# --- Redis Streams (Message Broker) ---
+redis[hiredis]==5.2.1          # hiredis C parser for wire-protocol acceleration
+
+# --- Observability ---
+structlog==24.4.0              # Structured async-safe logging
+
+# --- Runtime ---
+python-dotenv==1.0.1           # Railway env injection fallback
