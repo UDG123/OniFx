@@ -1,67 +1,121 @@
 # ==========================================================================
-# OniQuant v6.0 — Tri-State Risk Regime Configuration
+# OniFx — Tri-State Risk Regime & Capital Sleeve Configuration
 # ==========================================================================
-# Defines three operational states for the Bayesian Arbiter.
-# Each regime applies Power Priors, Likelihood Tempering, and
-# Fractional Kelly sizing independently — evaluated in parallel.
 #
-# Power Priors (prior_discount_a0):
-#   P_regime(A) = P(A) ^ a0
-#   a0=1.0 → full trust in historical win rate
-#   a0=0.15 → near-flat prior (aggressive: let live data dominate)
+# Architecture: 3 Autonomous Floors (Capital Sleeves)
+# ────────────────────────────────────────────────────
+# Each floor operates as an ISOLATED sub-account with its own:
+#   - Capital allocation (sleeve_allocation_pct)
+#   - Bayesian threshold / Power Priors / Likelihood Tempering
+#   - Risk-Scaled Sizing Factor (RSSF): raw_kelly × rssf_multiplier
+#   - Signal type and Telegram channel
 #
-# Likelihood Tempering (tempering_T):
-#   L_tempered = L ^ (1/T)
-#   T=1.0 → raw likelihood (conservative: full penalty curve)
-#   T=2.5 → flattened likelihood (aggressive: reduced impact)
+# The "1/10th Kelly" Rule:
+#   Every floor uses rssf_multiplier = 0.10 (10% of raw Kelly).
+#   This is NOT quarter-Kelly. It is a deliberate 1/10th scaling
+#   to keep per-trade risk between 2.92% - 3.33% of the SLEEVE,
+#   not the total account. This matters because:
+#     - A 3.25% loss on the Stable sleeve = 1.625% of total NLV
+#     - A 2.92% loss on the Aggressive sleeve = 0.584% of total NLV
+#   Maximum theoretical drawdown across all 3 sleeves simultaneously
+#   at full Kelly-fill: 3.25%×50% + 3.33%×30% + 2.92%×20% = 3.21% of NLV.
 #
-# Kelly Sizing (kelly_fraction):
-#   f_position = kelly_fraction × f*_kelly
-#   0.10 → 10% of Kelly (conservative)
-#   0.50 → 50% of Kelly (aggressive, still sub-Kelly safe)
+# The "50/30/20 Rule" (Capital Sleeve Allocation):
+#   STABLE:      50% of NLV → Mean reversion, tight stops, high frequency
+#   ACTIVE:      30% of NLV → Trend-following, moderate hold periods
+#   AGGRESSIVE:  20% of NLV → Volatility breakouts, wide stops, swing trades
 #
-# Capital Cap (max_cap_pct):
-#   Hard ceiling on any single position as % of NLV.
-#
-# active_regime: which regime controls LIVE order flow.
-# All three regimes are ALWAYS evaluated for shadow logging.
 # ==========================================================================
 
 active_regime: "conservative"
 
+# --------------------------------------------------------------------------
+# Sleeve Allocation (50/30/20 Rule)
+# --------------------------------------------------------------------------
+
 regimes:
   conservative:
-    label: "Conservative"
+    label: "STABLE"
+    sleeve_allocation_pct: 0.50
+
+    # Bayesian Engine Parameters
     threshold: 0.70
     prior_discount_a0: 0.80
     tempering_T: 1.0
+
+    # 1/10th Kelly Sizing (RSSF)
+    raw_kelly: 0.325
+    rssf_multiplier: 0.10
+    final_sleeve_risk: 0.0325
+
+    # Legacy fields (preserved for backward compatibility)
     kelly_fraction: 0.10
     max_cap_pct: 0.01
+
+    # Signal Profile
+    signal_type: "MEAN REVERSION"
+    signal_emoji: "\U0001F3E2"
+    telegram_channel_env: "TELEGRAM_CHANNEL_STABLE"
+
     description: >
-      Default safe state. Full penalty curve, tight threshold,
-      10% Kelly sizing, 1% capital cap per position. Suitable for
-      Monday opens, high-VIX environments, or post-drawdown recovery.
+      Default safe state. Full penalty curve, tight threshold.
+      Targets mean-reversion setups with tight stops.
+      1/10th Kelly = 3.25% risk per trade on the STABLE sleeve (50% of NLV).
+      Suitable for Monday opens, high-VIX, or post-drawdown recovery.
 
   active:
-    label: "Active"
+    label: "ACTIVE"
+    sleeve_allocation_pct: 0.30
+
+    # Bayesian Engine Parameters
     threshold: 0.60
     prior_discount_a0: 0.50
     tempering_T: 1.5
+
+    # 1/10th Kelly Sizing (RSSF)
+    raw_kelly: 0.333
+    rssf_multiplier: 0.10
+    final_sleeve_risk: 0.0333
+
+    # Legacy fields
     kelly_fraction: 0.25
     max_cap_pct: 0.025
+
+    # Signal Profile
+    signal_type: "TREND FOLLOWING"
+    signal_emoji: "\U0001F4C8"
+    telegram_channel_env: "TELEGRAM_CHANNEL_ACTIVE"
+
     description: >
-      Standard operating state. Moderate prior discount lets live
-      signals weigh heavier, tempering softens penalty curve for
-      borderline setups. 25% Kelly with 2.5% cap.
+      Standard operating state. Moderate prior discount, softened
+      penalty curve for borderline setups. Targets trend-following.
+      1/10th Kelly = 3.33% risk per trade on the ACTIVE sleeve (30% of NLV).
 
   aggressive:
-    label: "Aggressive"
+    label: "AGGRESSIVE"
+    sleeve_allocation_pct: 0.20
+
+    # Bayesian Engine Parameters
     threshold: 0.51
     prior_discount_a0: 0.15
     tempering_T: 2.5
+
+    # 1/10th Kelly Sizing (RSSF)
+    raw_kelly: 0.292
+    rssf_multiplier: 0.10
+    final_sleeve_risk: 0.0292
+
+    # Legacy fields
     kelly_fraction: 0.50
     max_cap_pct: 0.05
+
+    # Signal Profile
+    signal_type: "VOLATILITY BREAKOUT"
+    signal_emoji: "\U0001F680"
+    telegram_channel_env: "TELEGRAM_CHANNEL_AGGRESSIVE"
+
     description: >
-      High-conviction state. Near-flat priors, heavily flattened
-      penalty curve, 50% Kelly. Only activate when CPCV shows
-      Deflated Sharpe > 2.0 and PBO < 10% for this regime.
+      High-conviction state. Near-flat priors, flattened penalty curve.
+      Targets volatility breakouts with wide stops. Only activate when
+      CPCV shows Deflated Sharpe > 2.0 and PBO < 10% for this regime.
+      1/10th Kelly = 2.92% risk per trade on the AGGRESSIVE sleeve (20% of NLV).
