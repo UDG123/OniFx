@@ -16,5 +16,10 @@ redis[hiredis]==5.2.1          # hiredis C parser for wire-protocol acceleration
 # --- Observability ---
 structlog==24.4.0              # Structured async-safe logging
 
+# --- WFO / Backtesting Engine ---
+vectorbt==0.26.2               # Vectorized backtesting (NumPy/Pandas core)
+numpy==1.26.4                  # Pinned for vectorbt compat
+pandas==2.2.3                  # DataFrame engine
+
 # --- Runtime ---
 python-dotenv==1.0.1           # Railway env injection fallback
