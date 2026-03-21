@@ -16,6 +16,10 @@ redis[hiredis]==5.2.1          # hiredis C parser for wire-protocol acceleration
 # --- Observability ---
 structlog==24.4.0              # Structured async-safe logging
 
+# --- Broker Connectors ---
+ib_async==1.0.3                # IBKR Gateway connector (async ib_insync fork)
+pybit==5.9.0                   # Bybit Unified V5 REST + WebSocket
+
 # --- WFO / Backtesting Engine ---
 vectorbt==0.26.2               # Vectorized backtesting (NumPy/Pandas core)
 numpy==1.26.4                  # Pinned for vectorbt compat
