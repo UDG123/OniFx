@@ -30,6 +30,7 @@ from app.core.config import get_settings
 from app.core.database import close_pool, init_pool
 from app.core.redis import close_redis, get_redis, init_redis
 from app.middleware import LatencyMiddleware
+from app.schemas import MAX_PAYLOAD_SIZE, TradingViewPayload
 
 # ---------------------------------------------------------------------------
 # Rate Limiter Configuration
@@ -193,15 +194,52 @@ async def ingest_luxalgo(request: Request) -> Response:
             },
         )
 
-    # Zero-copy body read
+    # ── Payload Size Gate ────────────────────────────────────
     raw: bytes = await request.body()
+    if len(raw) > MAX_PAYLOAD_SIZE:
+        await log.awarning(
+            "payload_too_large",
+            client_ip=client_ip,
+            size=len(raw),
+            max_size=MAX_PAYLOAD_SIZE,
+        )
+        return Response(
+            content=orjson.dumps({"error": "payload_too_large"}),
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            headers={"content-type": "application/json"},
+        )
+
+    # ── Schema Validation & Injection Prevention ──────────────
+    try:
+        parsed = orjson.loads(raw)
+        payload = TradingViewPayload(**parsed)
+    except orjson.JSONDecodeError:
+        await log.awarning("invalid_json", client_ip=client_ip)
+        return Response(
+            content=orjson.dumps({"error": "invalid_json"}),
+            status_code=status.HTTP_400_BAD_REQUEST,
+            headers={"content-type": "application/json"},
+        )
+    except Exception as e:
+        await log.awarning(
+            "payload_validation_failed",
+            client_ip=client_ip,
+            error=str(e),
+        )
+        return Response(
+            content=orjson.dumps({"error": "validation_failed", "detail": str(e)}),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            headers={"content-type": "application/json"},
+        )
+
+    # Re-serialize the validated payload (strips unknown fields)
+    validated_raw = orjson.dumps(payload.model_dump())
 
     # Optionally enrich with live WFO parameters for this desk
-    # The WFO engine publishes optimal params to oniquant:config:{desk_id}
-    desk_params = await pool.get("oniquant:config:luxalgo")
+    desk_params = await pool.get(f"oniquant:config:{payload.desk_id}")
 
     # Build stream entry — include live config ref if available
-    fields: dict[str, bytes] = {"payload": raw, "source": b"luxalgo"}
+    fields: dict[str, bytes] = {"payload": validated_raw, "source": b"luxalgo"}
     if desk_params is not None:
         fields["live_params"] = desk_params
 

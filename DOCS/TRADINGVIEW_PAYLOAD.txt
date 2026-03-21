@@ -1,0 +1,115 @@
+OniFx — TradingView Webhook Payload Reference
+=================================================
+Last Updated: 2026-03-21
+Schema Source: app/schemas.py (TradingViewPayload)
+
+This file documents the exact JSON format expected by the
+OniFx webhook endpoint:
+
+    POST https://<your-domain>/webhook/luxalgo
+
+Keep this file in sync with app/schemas.py. The Night Auditor
+(scripts/night_auditor.py) validates sync weekly.
+
+==========================================================
+REQUIRED FIELDS
+==========================================================
+
+signal_id       (string, max 64 chars)
+    Unique identifier for this signal. If empty, the system
+    generates a UUID. Used for deduplication and audit trail.
+    Example: "luxalgo_SPY_20260321_143022"
+
+desk_id         (string, max 64 chars)
+    Which desk/strategy generated this signal. Must be one of:
+    scalper_spx, scalper_fx, scalper_ndx, swing_tech,
+    macro_metals, macro_gold, alts_major, alts_mid,
+    alts_btc, alts_eth, luxalgo
+    Example: "scalper_spx"
+
+asset_symbol    (string, max 32 chars)
+    Instrument ticker. Alphanumeric + underscores/hyphens only.
+    Example: "SPY", "BTCUSDT", "GC_F", "EURUSD"
+
+signal_direction (integer, -1 or 1)
+    Trade direction. 1 = BUY/LONG, -1 = SELL/SHORT.
+    0 is not permitted.
+
+target_price    (float, > 0, < 1,000,000)
+    The target/limit price for the trade.
+    Example: 451.20
+
+confidence      (float, 0.0 to 1.0)
+    Signal confidence from the indicator. Mapped to the
+    Bayesian likelihood pipeline.
+    Example: 0.85
+
+==========================================================
+OPTIONAL FIELDS (with defaults)
+==========================================================
+
+iof_strength    (float, 0.0 to 1.0, default: 0.5)
+    Institutional Order Flow strength score.
+    >0.80 → strong boost, <0.30 → penalty.
+
+hurst_exponent  (float, 0.0 to 1.0, default: 0.5)
+    Hurst exponent from Alpha Stack.
+    <0.45 = mean-reverting, >0.55 = trending.
+
+model_source    (string, default: "luxalgo")
+    Which Alpha Stack model generated the signal.
+    Allowed: "luxalgo", "spline", "knn", "unknown"
+
+asset_class     (string, default: "equity")
+    Asset class for routing and macro alignment.
+    Allowed: "equity", "forex", "metals", "gold", "futures",
+    "index", "crypto", "perpetual", "spot_crypto"
+
+indicator_metadata (object, default: {})
+    Free-form metadata dict. Max serialized size: 4096 bytes.
+    Used for audit trail only — not processed by the engine.
+
+ttl_seconds     (integer, 10 to 3600, default: 300)
+    Time-to-live for this signal in the pending trades ZSET.
+    After TTL expires, the signal is discarded if not filled.
+
+==========================================================
+TRADINGVIEW ALERT MESSAGE FORMAT
+==========================================================
+
+Paste this into your TradingView alert "Message" field:
+
+{
+  "signal_id": "{{ticker}}_{{timenow}}",
+  "desk_id": "luxalgo",
+  "asset_symbol": "{{ticker}}",
+  "signal_direction": {{strategy.order.action == "buy" ? 1 : -1}},
+  "target_price": {{close}},
+  "confidence": 0.75,
+  "iof_strength": 0.5,
+  "hurst_exponent": 0.5,
+  "model_source": "luxalgo",
+  "asset_class": "equity",
+  "indicator_metadata": {},
+  "ttl_seconds": 300
+}
+
+==========================================================
+VALIDATION RULES
+==========================================================
+
+1. Maximum payload size: 8192 bytes (8 KiB)
+2. All string fields: alphanumeric + _ - . / : space only
+3. desk_id must be in the known desk whitelist
+4. asset_class and model_source must be in allowed sets
+5. indicator_metadata serialized size <= 4096 bytes
+6. Payloads failing validation return 422 with error detail
+
+==========================================================
+SECURITY
+==========================================================
+
+- Rate limited: 60 requests/minute per IP (429 on breach)
+- Unknown fields are silently stripped (Pydantic strict mode)
+- Oversized payloads rejected with 413 before parsing
+- Invalid JSON rejected with 400 before validation
