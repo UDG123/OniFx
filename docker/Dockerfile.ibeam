@@ -7,10 +7,11 @@
 
 FROM voyz/ibeam:latest
 
-# Install 2FA tooling and virtual display dependencies
+# Install 2FA tooling, NTP sync, and virtual display dependencies
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     oathtool \
+    chrony \
     xvfb \
     libxi6 \
     libgconf-2-4 \
@@ -19,6 +20,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Configure chrony for container clock sync (HIGH-02 fix).
+# Uses Google and pool.ntp.org time servers for redundancy.
+# makestep 1.0 3: if clock is off by >1s, step immediately (up to 3 times).
+RUN printf '%s\n' \
+    'server time.google.com iburst' \
+    'server time1.google.com iburst' \
+    'server pool.ntp.org iburst' \
+    'makestep 1.0 3' \
+    'rtcsync' \
+    > /etc/chrony/chrony.conf
 
 # Copy 2FA generation script
 COPY scripts/generate_2fa.py /opt/ibeam/generate_2fa.py

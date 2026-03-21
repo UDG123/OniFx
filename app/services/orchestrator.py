@@ -14,6 +14,7 @@ Likelihood Multipliers:
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -28,6 +29,31 @@ from app.core.config import get_settings
 from app.core.database import query_win_rate
 
 log = structlog.get_logger("oniquant.orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# Indicator Correlation Matrix (HIGH-01 fix — Bayesian De-correlation)
+# ---------------------------------------------------------------------------
+# Pairwise correlation estimates between likelihood factors.
+# When two indicators share underlying signal overlap (e.g., IOF and kNN
+# both respond to volume/momentum), their combined evidence is overstated
+# by naive multiplication. The square-root penalty corrects for this:
+#
+#     L_adjusted = L ^ (1 / sqrt(1 + ρ))
+#
+# where ρ is the max pairwise correlation among active boosting factors.
+#
+# Keys: frozenset of factor-pair names → estimated correlation coefficient.
+# These values should be calibrated empirically via backtest; defaults
+# are conservative estimates from microstructure literature.
+# ---------------------------------------------------------------------------
+INDICATOR_CORRELATION_MATRIX: dict[frozenset[str], float] = {
+    frozenset({"iof", "hurst_knn"}): 0.60,   # IOF displacement + kNN volume features overlap
+    frozenset({"iof", "hurst_spline"}): 0.20, # IOF and spline have low structural overlap
+    frozenset({"iof", "macro"}): 0.10,        # IOF is micro; macro is macro — near-independent
+    frozenset({"hurst_knn", "macro"}): 0.15,  # kNN features are asset-level, not macro-driven
+    frozenset({"hurst_spline", "macro"}): 0.10,
+}
 
 
 class Decision(str, Enum):
@@ -114,20 +140,33 @@ class BayesianArbiter:
         asset_class: str,
     ) -> tuple[float, str]:
         """
-        Multiplicative likelihood adjustment.
+        Multiplicative likelihood adjustment with correlation de-duplication.
 
         Factor 1: IOF — >0.80 → ×1.50, >0.60 → ×1.20, <0.30 → ×0.70
         Factor 2: Macro — aligned → ×1.20, opposed → ×0.80
         Factor 3: Hurst — H<0.45+Spline → ×1.30, H>0.55+kNN → ×1.30, mismatch → ×0.75
+
+        De-correlation (HIGH-01 fix):
+            Tracks which factors actively boosted the likelihood (multiplier > 1.0).
+            If any pair of boosting factors has a high correlation in
+            INDICATOR_CORRELATION_MATRIX, applies a square-root penalty:
+
+                L_adjusted = L ^ (1 / sqrt(1 + ρ_max))
+
+            This dampens the compound evidence to account for shared
+            information, keeping the posterior grounded near the 69.5% threshold.
         """
         L = 1.0
         parts = []
+        active_factors: list[str] = []  # factors that boosted L (mult > 1.0)
 
         # IOF
         if iof_strength > 0.80:
             L *= 1.50; parts.append(f"IOF={iof_strength:.2f}→×1.50")
+            active_factors.append("iof")
         elif iof_strength > 0.60:
             L *= 1.20; parts.append(f"IOF={iof_strength:.2f}→×1.20")
+            active_factors.append("iof")
         elif iof_strength < 0.30:
             L *= 0.70; parts.append(f"IOF={iof_strength:.2f}→×0.70")
         else:
@@ -155,22 +194,62 @@ class BayesianArbiter:
                 macro_mult = 0.80
         L *= macro_mult
         parts.append(f"macro→×{macro_mult:.2f}")
+        if macro_mult > 1.0:
+            active_factors.append("macro")
 
         # Hurst
         model = model_source.lower()
+        hurst_factor_name: str | None = None
         if hurst < 0.45:
-            if model == "spline": L *= 1.30; parts.append(f"H={hurst:.3f}+spline→×1.30")
-            elif model == "knn": L *= 0.75; parts.append(f"H={hurst:.3f}+knn→×0.75")
-            else: parts.append(f"H={hurst:.3f}→×1.00")
+            if model == "spline":
+                L *= 1.30; parts.append(f"H={hurst:.3f}+spline→×1.30")
+                hurst_factor_name = "hurst_spline"
+            elif model == "knn":
+                L *= 0.75; parts.append(f"H={hurst:.3f}+knn→×0.75")
+            else:
+                parts.append(f"H={hurst:.3f}→×1.00")
         elif hurst > 0.55:
-            if model == "knn": L *= 1.30; parts.append(f"H={hurst:.3f}+knn→×1.30")
-            elif model == "spline": L *= 0.75; parts.append(f"H={hurst:.3f}+spline→×0.75")
-            else: parts.append(f"H={hurst:.3f}→×1.00")
+            if model == "knn":
+                L *= 1.30; parts.append(f"H={hurst:.3f}+knn→×1.30")
+                hurst_factor_name = "hurst_knn"
+            elif model == "spline":
+                L *= 0.75; parts.append(f"H={hurst:.3f}+spline→×0.75")
+            else:
+                parts.append(f"H={hurst:.3f}→×1.00")
         else:
             parts.append(f"H={hurst:.3f}→×1.00")
 
+        if hurst_factor_name:
+            active_factors.append(hurst_factor_name)
+
+        # ── De-correlation Penalty (HIGH-01 fix) ─────────────────
+        # Find the maximum pairwise correlation among active boosting factors.
+        # If correlated indicators are both boosting, dampen the combined
+        # likelihood to prevent double-counting shared evidence.
+        rho_max = 0.0
+        if len(active_factors) >= 2:
+            for i in range(len(active_factors)):
+                for j in range(i + 1, len(active_factors)):
+                    pair = frozenset({active_factors[i], active_factors[j]})
+                    rho = INDICATOR_CORRELATION_MATRIX.get(pair, 0.0)
+                    rho_max = max(rho_max, rho)
+
+        if rho_max > 0.0 and L > 1.0:
+            # Square-root penalty: L_adj = L ^ (1 / sqrt(1 + ρ))
+            # When ρ=0 → exponent=1.0 (no change)
+            # When ρ=0.6 → exponent≈0.79 (dampens L=1.95 to ~1.73)
+            # When ρ=1.0 → exponent≈0.71 (maximum dampening)
+            exponent = 1.0 / math.sqrt(1.0 + rho_max)
+            L_raw = L
+            L = L ** exponent
+            parts.append(f"ρ_max={rho_max:.2f}→L^{exponent:.3f}={L:.4f} (was {L_raw:.4f})")
+
         # Clamp
+        raw_L = L
         L = max(0.3, min(3.0, L))
+        if L != raw_L:
+            parts.append(f"CLAMPED:{raw_L:.4f}→{L:.4f}")
+
         return L, " | ".join(parts)
 
     # ------------------------------------------------------------------

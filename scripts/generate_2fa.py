@@ -39,8 +39,10 @@ def generate_totp(secret: str | None = None) -> str:
         sys.exit(1)
 
     try:
+        # -w 1: accept codes from adjacent 30-second windows (N-1, N, N+1)
+        # to tolerate up to ±30s of container clock drift (HIGH-02 fix).
         result = subprocess.run(
-            ["oathtool", "--totp", "--base32", secret],
+            ["oathtool", "--totp", "--base32", "-w", "1", secret],
             capture_output=True,
             text=True,
             timeout=5,
@@ -48,7 +50,11 @@ def generate_totp(secret: str | None = None) -> str:
         if result.returncode != 0:
             print(f"ERROR: oathtool failed: {result.stderr.strip()}", file=sys.stderr)
             sys.exit(1)
-        return result.stdout.strip()
+        # With -w 1, oathtool outputs multiple codes (one per line).
+        # Return the LAST code — it corresponds to the current or next window,
+        # which is most likely to still be valid when IBKR processes it.
+        codes = result.stdout.strip().splitlines()
+        return codes[-1] if codes else result.stdout.strip()
     except FileNotFoundError:
         print("ERROR: oathtool not installed", file=sys.stderr)
         sys.exit(1)
