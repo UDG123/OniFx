@@ -3,10 +3,16 @@ OniQuant v6.0 — Security & Secrets Management
 =================================================
 Loads secrets from Railway environment variables.
 Ensures sensitive values are NEVER logged, even in debug mode.
+
+Authentication:
+    - SIGNAL_SECRET_TOKEN: shared secret for TradingView webhook auth.
+      Must be sent as the X-OniQuant-Auth header on every webhook request.
+      Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
 """
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 from typing import Any
@@ -15,11 +21,44 @@ import structlog
 
 log = structlog.get_logger("oniquant.security")
 
-# Patterns that indicate a secret value — never log these
+# ---------------------------------------------------------------------------
+# Secret Redaction
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a secret value — never log these.
+# Covers: passwords, API keys, tokens, credentials, private keys,
+# the signal auth token, and rotated desk_id suffixes (hex tails).
 _SECRET_PATTERNS = re.compile(
-    r"(password|secret|api_key|api_secret|token|credential|private_key)",
+    r"(password|secret|api_key|api_secret|token|credential|private_key"
+    r"|signal_secret|oniquant.auth|desk_id|x.oniquant)",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Signal Authentication (X-OniQuant-Auth header)
+# ---------------------------------------------------------------------------
+
+# Loaded once at import time. If unset, all webhook requests are rejected.
+_SIGNAL_SECRET_TOKEN: str = os.getenv("SIGNAL_SECRET_TOKEN", "")
+
+
+def verify_signal_auth(header_value: str | None) -> bool:
+    """
+    Constant-time comparison of the X-OniQuant-Auth header against
+    the configured SIGNAL_SECRET_TOKEN.
+
+    Returns True only if:
+        1. SIGNAL_SECRET_TOKEN is configured (non-empty).
+        2. header_value matches SIGNAL_SECRET_TOKEN exactly.
+
+    Uses hmac.compare_digest to prevent timing side-channels.
+    """
+    if not _SIGNAL_SECRET_TOKEN:
+        # Fail closed: if no token configured, reject everything.
+        return False
+    if not header_value:
+        return False
+    return hmac.compare_digest(header_value, _SIGNAL_SECRET_TOKEN)
 
 
 def load_secret(env_var: str, required: bool = True) -> str:
@@ -52,6 +91,13 @@ def redact_secrets(data: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def redact_value(value: str) -> str:
+    """Redact a raw string value, showing only the last 4 chars."""
+    if len(value) <= 4:
+        return "***REDACTED***"
+    return f"***...{value[-4:]}"
+
+
 def validate_required_secrets() -> dict[str, bool]:
     """
     Validate that all required secrets are present.
@@ -61,6 +107,7 @@ def validate_required_secrets() -> dict[str, bool]:
     required = [
         "REDIS_URL",
         "DATABASE_URL",
+        "SIGNAL_SECRET_TOKEN",
     ]
     optional = [
         "IBKR_USER",

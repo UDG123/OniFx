@@ -29,6 +29,7 @@ from fastapi.responses import ORJSONResponse
 from app.core.config import get_settings
 from app.core.database import close_pool, init_pool
 from app.core.redis import close_redis, get_redis, init_redis
+from app.core.security import verify_signal_auth
 from app.middleware import LatencyMiddleware
 from app.schemas import MAX_PAYLOAD_SIZE, TradingViewPayload
 
@@ -141,8 +142,9 @@ def _get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-# Pre-built 429 response
+# Pre-built error responses
 _RATE_LIMITED_BODY: bytes = orjson.dumps({"error": "rate_limit_exceeded"})
+_FORBIDDEN_BODY: bytes = orjson.dumps({"error": "forbidden"})
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +175,21 @@ async def ingest_luxalgo(request: Request) -> Response:
     """
     settings = get_settings()
     pool = get_redis()
+
+    # ── Auth Gate (before rate limiter — zero Redis cost) ─────
+    auth_header = request.headers.get("x-oniquant-auth")
+    if not verify_signal_auth(auth_header):
+        client_ip = _get_client_ip(request)
+        await log.awarning(
+            "auth_rejected",
+            client_ip=client_ip,
+            reason="missing_or_invalid_token",
+        )
+        return Response(
+            content=_FORBIDDEN_BODY,
+            status_code=status.HTTP_403_FORBIDDEN,
+            headers={"content-type": "application/json"},
+        )
 
     # ── Rate Limit Gate ───────────────────────────────────────
     client_ip = _get_client_ip(request)
