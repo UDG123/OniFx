@@ -437,11 +437,107 @@ async def run_audit(lookback_days: int = 7, dry_run: bool = False) -> AuditRepor
     return report
 
 
+# ---------------------------------------------------------------------------
+# 5. Config Sanity Check (called from monday_open.sh)
+# ---------------------------------------------------------------------------
+
+MAX_SLEEVE_RISK: float = 0.05  # 5% hard institutional ceiling
+
+def verify_config_sanity() -> bool:
+    """
+    Validate risk_profiles.yaml against institutional risk limits.
+
+    Checks:
+        - No regime's final_sleeve_risk exceeds 5%.
+        - sleeve_allocation_pct values sum to <= 1.0.
+        - All required keys are present per regime.
+
+    Returns True if all checks pass, False otherwise.
+    Called by scripts/monday_open.sh as a pre-flight gate.
+    """
+    import yaml
+
+    config_path = Path(__file__).resolve().parents[1] / "config" / "risk_profiles.yaml"
+    if not config_path.exists():
+        print(f"FAIL: {config_path} does not exist")
+        return False
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    regimes = config.get("regimes", {})
+    if not regimes:
+        print("FAIL: No regimes defined in risk_profiles.yaml")
+        return False
+
+    passed = True
+    total_allocation = 0.0
+
+    required_keys = [
+        "threshold", "raw_kelly", "rssf_multiplier",
+        "final_sleeve_risk", "sleeve_allocation_pct",
+    ]
+
+    for name, params in regimes.items():
+        label = params.get("label", name.upper())
+
+        # Check required keys
+        for key in required_keys:
+            if key not in params:
+                print(f"FAIL: [{label}] missing required key '{key}'")
+                passed = False
+
+        # Check final_sleeve_risk ceiling
+        fsr = params.get("final_sleeve_risk", 0)
+        if fsr > MAX_SLEEVE_RISK:
+            print(
+                f"FAIL: [{label}] final_sleeve_risk={fsr:.4f} "
+                f"exceeds {MAX_SLEEVE_RISK:.0%} institutional ceiling"
+            )
+            passed = False
+        else:
+            print(f"  OK: [{label}] final_sleeve_risk={fsr:.4f} (<= {MAX_SLEEVE_RISK:.0%})")
+
+        # Check RSSF consistency: raw_kelly * rssf_multiplier == final_sleeve_risk
+        raw_kelly = params.get("raw_kelly", 0)
+        rssf = params.get("rssf_multiplier", 0)
+        expected_fsr = round(raw_kelly * rssf, 6)
+        actual_fsr = round(fsr, 6)
+        if expected_fsr != actual_fsr:
+            print(
+                f"WARN: [{label}] RSSF mismatch: "
+                f"{raw_kelly} * {rssf} = {expected_fsr}, "
+                f"but final_sleeve_risk = {actual_fsr}"
+            )
+
+        total_allocation += params.get("sleeve_allocation_pct", 0)
+
+    # Sleeve allocations must not exceed 100%
+    if total_allocation > 1.0:
+        print(
+            f"FAIL: Total sleeve allocation = {total_allocation:.2%} "
+            f"(exceeds 100%)"
+        )
+        passed = False
+    else:
+        print(f"  OK: Total sleeve allocation = {total_allocation:.2%}")
+
+    return passed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="OniFx Night Auditor")
     parser.add_argument("--dry-run", action="store_true", help="Skip Telegram dispatch")
     parser.add_argument("--lookback-days", type=int, default=7, help="Lookback window")
+    parser.add_argument(
+        "--sanity-only", action="store_true",
+        help="Only run config sanity check (for monday_open.sh)",
+    )
     args = parser.parse_args()
+
+    if args.sanity_only:
+        ok = verify_config_sanity()
+        sys.exit(0 if ok else 1)
 
     asyncio.run(run_audit(lookback_days=args.lookback_days, dry_run=args.dry_run))
 
